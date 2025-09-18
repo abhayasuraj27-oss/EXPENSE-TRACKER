@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 import os
 
 # Import route modules
-from app.routes import base
+from app.routes import base, upload
 
 # Load environment variables
 load_dotenv()
@@ -29,11 +29,12 @@ app.add_middleware(
 
 # Include route modules
 app.include_router(base.router)
+app.include_router(upload.router, prefix="/api/upload", tags=["upload"])
 
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",
+        "app.main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True  # Auto-reload on code changes
+        reload=True
     )
