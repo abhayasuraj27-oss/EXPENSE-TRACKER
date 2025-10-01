@@ -6,6 +6,7 @@ import os
 
 # Import route modules
 from app.routes import base, upload
+from app.routes import transactions as transactions_routes
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +31,7 @@ app.add_middleware(
 # Include route modules
 app.include_router(base.router)
 app.include_router(upload.router, prefix="/api/upload", tags=["upload"])
+app.include_router(transactions_routes.router, prefix="/api/transactions", tags=["transactions"])
 
 if __name__ == "__main__":
     uvicorn.run(

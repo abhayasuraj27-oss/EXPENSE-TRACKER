@@ -1,5 +1,7 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, status
 import os
+from app.services.ocr_service import ocr_service
+from app.services.categorizer import suggest_category
 
 # Create router for upload endpoints
 router = APIRouter()
@@ -30,13 +32,25 @@ async def upload_file(file: UploadFile = File(...)):
         if len(file_content) > 10 * 1024 * 1024:
             raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="File too large. Max 10MB")
         
-        # For now, just return basic info (we'll add OCR later)
+        # Extract text based on file type
+        if file_extension == '.pdf':
+            text = ocr_service.extract_text_from_pdf(file_content)
+        else:
+            text = ocr_service.extract_text_from_image(file_content)
+        
+        # Parse transactions from extracted text
+        transactions = ocr_service.parse_transactions(text)
+        for t in transactions:
+	        t["suggested_category"] = suggest_category(t["description"])
+        
         return {
             "success": True,
             "filename": file.filename,
             "file_type": file_extension,
             "file_size": len(file_content),
-            "message": "File uploaded successfully! OCR processing coming next..."
+            "transactions": transactions,
+            "transaction_count": len(transactions),
+            "raw_text": text[:200] + "..." if len(text) > 200 else text
         }
         
     except Exception as e:
