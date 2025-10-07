@@ -8,6 +8,7 @@ from app.models import Transaction
 from app.schemas import TransactionCreate, TransactionResponse, TransactionBatchCreate
 import re
 from typing import Dict, List
+from datetime import date as _date, datetime as _datetime
 
 # Create tables on import
 Base.metadata.create_all(bind=engine)
@@ -57,23 +58,65 @@ def suggest_category(description: str) -> str:
 
 router = APIRouter()
 
+# Dependency to get current user id from auth (to be implemented in auth module)
+def get_current_user_id():
+    from app.routes.auth import get_current_user
+    return Depends(lambda token_dep=Depends(get_current_user): token_dep.id)
+def _normalize_date_field(value) -> _date:
+    """Accepts a date, datetime, or string and returns a python date.
+    Expected input is YYYY-MM-DD. We avoid ambiguous swaps.
+    If clearly provided as YYYY-DD-MM (middle > 12 and last <= 12), we swap.
+    """
+    if isinstance(value, _date):
+        return value
+    if isinstance(value, _datetime):
+        return value.date()
+    if isinstance(value, str):
+        s = value.strip().replace('/', '-').replace('.', '-')
+        parts = s.split('-')
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit() and parts[2].isdigit():
+            y, mid, last = int(parts[0]), int(parts[1]), int(parts[2])
+            # If middle looks like day (>12) and last looks like month (<=12), swap to treat as YYYY-DD-MM
+            if mid > 12 and 1 <= last <= 12:
+                m, d = last, mid
+            else:
+                # Default assume YYYY-MM-DD
+                m, d = mid, last
+            try:
+                return _date(y, m, d)
+            except ValueError:
+                # Fallback: try datetime parser
+                pass
+        # Generic fallback parsing
+        try:
+            return _datetime.fromisoformat(s).date()
+        except Exception:
+            pass
+    # If all else fails, raise a clear error
+    raise HTTPException(status_code=400, detail=f"Invalid date format: {value}")
+
+
 @router.post("/", response_model=TransactionResponse, status_code=status.HTTP_201_CREATED)
-def create_transaction(txn: TransactionCreate, db: Session = Depends(get_db)):
+def create_transaction(txn: TransactionCreate, db: Session = Depends(get_db), user_id: int = get_current_user_id()):
 	payload = txn.dict()
+	# Normalize date field to proper YYYY-MM-DD
+	payload["date"] = _normalize_date_field(payload.get("date"))
 	if not payload.get("category"):
 		payload["category"] = "Uncategorized"
-	row = Transaction(**payload)
+	row = Transaction(**payload, user_id=user_id)
 	db.add(row); db.commit(); db.refresh(row)
 	return row
 
 @router.post("/batch", response_model=List[TransactionResponse], status_code=status.HTTP_201_CREATED)
-def create_transactions(payload: TransactionBatchCreate, db: Session = Depends(get_db)):
+def create_transactions(payload: TransactionBatchCreate, db: Session = Depends(get_db), user_id: int = get_current_user_id()):
 	if not payload.items:
 		raise HTTPException(status_code=400, detail="No items provided")
 
 	rows = []
 	for i in payload.items:
 		data = i.dict()
+		# Normalize date if needed
+		data["date"] = _normalize_date_field(data.get("date"))
 		# accept category if provided; else use suggested_category if present; else compute
 		if not data.get("category"):
 			suggested = getattr(i, "suggested_category", None)
@@ -83,7 +126,7 @@ def create_transactions(payload: TransactionBatchCreate, db: Session = Depends(g
 				from app.services.categorizer import suggest_category
 				data["category"] = suggest_category(data["description"]) or "Uncategorized"
 
-		row = Transaction(**data)
+		row = Transaction(**data, user_id=user_id)
 		db.add(row)
 		rows.append(row)
 
@@ -93,11 +136,27 @@ def create_transactions(payload: TransactionBatchCreate, db: Session = Depends(g
 	return rows
 
 @router.get("/", response_model=List[TransactionResponse])
-def list_transactions(skip: int = 0, limit: int = Query(100, le=500), db: Session = Depends(get_db)):
-	return db.query(Transaction).order_by(desc(Transaction.date), desc(Transaction.id)).offset(skip).limit(limit).all()
+def list_transactions(skip: int = 0, limit: int = Query(100, le=500), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
+    return db.query(Transaction).filter(Transaction.user_id == user_id).order_by(desc(Transaction.date), desc(Transaction.id)).offset(skip).limit(limit).all()
+
+@router.delete("/")
+def delete_all_transactions(db: Session = Depends(get_db), user_id: int = get_current_user_id()):
+    """Delete all transactions in the database."""
+    deleted = db.query(Transaction).filter(Transaction.user_id == user_id).delete()
+    db.commit()
+    return {"deleted": int(deleted)}
+
+@router.delete("/{txn_id}")
+def delete_transaction(txn_id: int, db: Session = Depends(get_db), user_id: int = get_current_user_id()):
+    row = db.query(Transaction).filter(Transaction.id == txn_id, Transaction.user_id == user_id).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    db.delete(row)
+    db.commit()
+    return {"deleted": True, "id": txn_id}
 
 @router.get("/analytics/weekly")
-def get_weekly_analytics(weeks: int = Query(4, ge=1, le=52), db: Session = Depends(get_db)):
+def get_weekly_analytics(weeks: int = Query(4, ge=1, le=52), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
 	"""Get weekly spending analytics for the last N weeks"""
 	from sqlalchemy import func, extract
 	from datetime import datetime, timedelta
@@ -114,7 +173,8 @@ def get_weekly_analytics(weeks: int = Query(4, ge=1, le=52), db: Session = Depen
 		func.count(Transaction.id).label('transaction_count')
 	).filter(
 		Transaction.date >= start_date,
-		Transaction.date <= end_date
+		Transaction.date <= end_date,
+		Transaction.user_id == user_id
 	).group_by(
 		extract('year', Transaction.date),
 		extract('week', Transaction.date)
@@ -141,7 +201,7 @@ def get_weekly_analytics(weeks: int = Query(4, ge=1, le=52), db: Session = Depen
 	}
 
 @router.get("/analytics/monthly")
-def get_monthly_analytics(months: int = Query(12, ge=1, le=24), db: Session = Depends(get_db)):
+def get_monthly_analytics(months: int = Query(12, ge=1, le=24), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
 	"""Get monthly spending analytics for the last N months"""
 	from sqlalchemy import func, extract
 	from datetime import datetime, timedelta
@@ -158,7 +218,8 @@ def get_monthly_analytics(months: int = Query(12, ge=1, le=24), db: Session = De
 		func.count(Transaction.id).label('transaction_count')
 	).filter(
 		Transaction.date >= start_date,
-		Transaction.date <= end_date
+		Transaction.date <= end_date,
+		Transaction.user_id == user_id
 	).group_by(
 		extract('year', Transaction.date),
 		extract('month', Transaction.date)
@@ -185,7 +246,7 @@ def get_monthly_analytics(months: int = Query(12, ge=1, le=24), db: Session = De
 	}
 
 @router.get("/analytics/categories")
-def get_category_analytics(period_days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db)):
+def get_category_analytics(period_days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
 	"""Get spending analytics by category for the last N days"""
 	from sqlalchemy import func
 	from datetime import datetime, timedelta
@@ -202,7 +263,8 @@ def get_category_analytics(period_days: int = Query(30, ge=1, le=365), db: Sessi
 		func.avg(Transaction.amount).label('avg_amount')
 	).filter(
 		Transaction.date >= start_date,
-		Transaction.date <= end_date
+		Transaction.date <= end_date,
+		Transaction.user_id == user_id
 	).group_by(
 		Transaction.category
 	).order_by(
@@ -232,8 +294,45 @@ def get_category_analytics(period_days: int = Query(30, ge=1, le=365), db: Sessi
 		"category_data": result
 	}
 
+	
+@router.get("/analytics/categories-by-month")
+def get_categories_by_month(mm: int = Query(..., ge=1, le=12), year: int = Query(None), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
+	"""Get category-wise totals for a given month number.
+	If year is not provided, aggregate across all years.
+	"""
+	from sqlalchemy import func, extract
+
+	query = db.query(
+		Transaction.category.label('category'),
+		func.sum(Transaction.amount).label('total_amount'),
+		func.count(Transaction.id).label('transaction_count')
+	).filter(
+		extract('month', Transaction.date) == mm,
+		Transaction.user_id == user_id
+	)
+
+	if year is not None:
+		query = query.filter(extract('year', Transaction.date) == year)
+
+	query = query.group_by(Transaction.category).order_by(func.sum(Transaction.amount).desc())
+
+	rows = query.all()
+	result = []
+	for row in rows:
+		result.append({
+			"category": row.category or "Uncategorized",
+			"total_amount": float(row.total_amount or 0),
+			"transaction_count": int(row.transaction_count or 0)
+		})
+
+	return {
+		"month": int(mm),
+		"year": int(year) if year is not None else None,
+		"categories": result
+	}
+
 @router.get("/analytics/summary")
-def get_spending_summary(period_days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db)):
+def get_spending_summary(period_days: int = Query(30, ge=1, le=365), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
 	"""Get overall spending summary for the last N days"""
 	from sqlalchemy import func
 	from datetime import datetime, timedelta
@@ -251,7 +350,8 @@ def get_spending_summary(period_days: int = Query(30, ge=1, le=365), db: Session
 		func.max(Transaction.amount).label('max_transaction')
 	).filter(
 		Transaction.date >= start_date,
-		Transaction.date <= end_date
+		Transaction.date <= end_date,
+		Transaction.user_id == user_id
 	).first()
 	
 	# Get daily average
@@ -270,7 +370,7 @@ def get_spending_summary(period_days: int = Query(30, ge=1, le=365), db: Session
 	}
 
 @router.get("/analytics/calendar")
-def get_calendar_data(year: int = Query(None), month: int = Query(None), db: Session = Depends(get_db)):
+def get_calendar_data(year: int = Query(None), month: int = Query(None), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
 	"""Get calendar data for a specific month with daily spending"""
 	from sqlalchemy import func, extract
 	from datetime import datetime, date
@@ -295,7 +395,8 @@ def get_calendar_data(year: int = Query(None), month: int = Query(None), db: Ses
 		func.count(Transaction.id).label('transaction_count')
 	).filter(
 		Transaction.date >= start_date,
-		Transaction.date < end_date
+		Transaction.date < end_date,
+		Transaction.user_id == user_id
 	).group_by(
 		extract('day', Transaction.date)
 	).order_by(
@@ -329,6 +430,32 @@ def get_calendar_data(year: int = Query(None), month: int = Query(None), db: Ses
 		"daily_data": result
 	}
 
+@router.get("/analytics/by-month")
+def get_by_month(mm: int = Query(..., ge=1, le=12), year: int = Query(None), db: Session = Depends(get_db), user_id: int = get_current_user_id()):
+    """Get total amount and transaction count for a given month number.
+    If year is not provided, aggregate across all years.
+    """
+    from sqlalchemy import func, extract
+
+    query = db.query(
+        func.sum(Transaction.amount).label('total_amount'),
+        func.count(Transaction.id).label('transaction_count')
+    ).filter(
+        extract('month', Transaction.date) == mm,
+        Transaction.user_id == user_id
+    )
+
+    if year is not None:
+        query = query.filter(extract('year', Transaction.date) == year)
+
+    row = query.first()
+    return {
+        "month": int(mm),
+        "year": int(year) if year is not None else None,
+        "total_amount": float(row.total_amount or 0),
+        "transaction_count": int(row.transaction_count or 0)
+    }
+
 @router.get("/filter")
 def filter_transactions(
 	start_date: str = Query(None),
@@ -338,12 +465,13 @@ def filter_transactions(
 	max_amount: float = Query(None),
 	skip: int = Query(0, ge=0),
 	limit: int = Query(100, le=500),
-	db: Session = Depends(get_db)
+	db: Session = Depends(get_db),
+	user_id: int = get_current_user_id()
 ):
 	"""Filter transactions with various criteria"""
 	from datetime import datetime
 	
-	query = db.query(Transaction)
+	query = db.query(Transaction).filter(Transaction.user_id == user_id)
 	
 	# Apply filters
 	if start_date:
